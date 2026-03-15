@@ -412,7 +412,7 @@ def register_tools(app):
         try:
             start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
             end = datetime.datetime.strptime(end_date, "%Y-%m-%d")
-            if (end - start).days > 90:
+            if (end - start).days >= 90:
                 return "Date range too large. Please use a range of 90 days or less."
 
             trend = []
@@ -431,7 +431,9 @@ def register_tools(app):
                             "status": summary.get("status"),
                         }
                         entry = {k: v for k, v in entry.items() if v is not None}
-                        trend.append(entry)
+                        # Skip entries that only have the date (no actual data)
+                        if len(entry) > 1:
+                            trend.append(entry)
                 except Exception:
                     pass  # Skip days with no data
                 current += datetime.timedelta(days=1)
@@ -614,7 +616,7 @@ def register_tools(app):
         try:
             start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
             end = datetime.datetime.strptime(end_date, "%Y-%m-%d")
-            if (end - start).days > 90:
+            if (end - start).days >= 90:
                 return "Date range too large. Please use a range of 90 days or less."
 
             trend = []
@@ -643,7 +645,9 @@ def register_tools(app):
                             "load_ratio": acwr_data.get("dailyAcuteChronicWorkloadRatio"),
                         }
                         entry = {k: v for k, v in entry.items() if v is not None}
-                        trend.append(entry)
+                        # Skip entries that only have the date (no actual data)
+                        if len(entry) > 1:
+                            trend.append(entry)
                 except Exception:
                     pass  # Skip days with no data
                 current += datetime.timedelta(days=1)
