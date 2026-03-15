@@ -245,6 +245,51 @@ async def test_get_activity_hr_in_timezones_tool(app_with_activity_management, m
 
 
 @pytest.mark.asyncio
+async def test_get_activity_power_in_timezones_tool(app_with_activity_management, mock_garmin_client):
+    """Test get_activity_power_in_timezones tool returns power zone data"""
+    # Setup mock
+    power_zones = {
+        "zones": [
+            {"zone": 1, "timeInZone": 600, "percentageInZone": 33.3},
+            {"zone": 2, "timeInZone": 300, "percentageInZone": 16.7},
+            {"zone": 3, "timeInZone": 600, "percentageInZone": 33.3},
+            {"zone": 4, "timeInZone": 180, "percentageInZone": 10.0},
+            {"zone": 5, "timeInZone": 120, "percentageInZone": 6.7}
+        ]
+    }
+    mock_garmin_client.get_activity_power_in_timezones.return_value = power_zones
+
+    # Call tool
+    activity_id = 12345678901
+    result = await app_with_activity_management.call_tool(
+        "get_activity_power_in_timezones",
+        {"activity_id": activity_id}
+    )
+
+    # Verify
+    assert result is not None
+    mock_garmin_client.get_activity_power_in_timezones.assert_called_once_with(activity_id)
+
+
+@pytest.mark.asyncio
+async def test_get_activity_power_in_timezones_no_data(app_with_activity_management, mock_garmin_client):
+    """Test get_activity_power_in_timezones tool when activity has no power data"""
+    # Setup mock to return empty/None
+    mock_garmin_client.get_activity_power_in_timezones.return_value = None
+
+    # Call tool
+    activity_id = 12345678901
+    result = await app_with_activity_management.call_tool(
+        "get_activity_power_in_timezones",
+        {"activity_id": activity_id}
+    )
+
+    # Verify helpful message
+    assert result is not None
+    assert "No power zone data" in result[0][0].text or "power meter" in result[0][0].text
+
+
+@pytest.mark.asyncio
 async def test_get_activity_gear_tool(app_with_activity_management, mock_garmin_client):
     """Test get_activity_gear tool returns gear data"""
     # Setup mock
