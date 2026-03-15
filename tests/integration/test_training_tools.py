@@ -331,3 +331,46 @@ async def test_get_training_effect_exception(app_with_training, mock_garmin_clie
 
     # Verify error is handled gracefully
     assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_get_hrv_trend_tool(app_with_training, mock_garmin_client):
+    """Test get_hrv_trend tool returns HRV data over a date range"""
+    # Setup mock to return HRV data for each day
+    mock_garmin_client.get_hrv_data.return_value = MOCK_HRV_DATA
+
+    # Call tool
+    result = await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-13", "end_date": "2024-01-15"}
+    )
+
+    # Verify
+    assert result is not None
+    assert mock_garmin_client.get_hrv_data.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_hrv_trend_no_data(app_with_training, mock_garmin_client):
+    """Test get_hrv_trend tool when no HRV data found"""
+    mock_garmin_client.get_hrv_data.return_value = None
+
+    result = await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-13", "end_date": "2024-01-15"}
+    )
+
+    assert result is not None
+    # Should contain message about no data found
+
+
+@pytest.mark.asyncio
+async def test_get_hrv_trend_range_too_large(app_with_training, mock_garmin_client):
+    """Test get_hrv_trend tool rejects ranges over 90 days"""
+    result = await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-01", "end_date": "2024-06-01"}
+    )
+
+    assert result is not None
+    # Should contain message about range being too large

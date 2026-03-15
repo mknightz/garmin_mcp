@@ -399,6 +399,53 @@ def register_tools(app):
             return f"Error retrieving HRV data: {str(e)}"
 
     @app.tool()
+    async def get_hrv_trend(start_date: str, end_date: str) -> str:
+        """Get HRV trend over a date range
+
+        Returns daily HRV summaries for trend analysis (e.g. 7-day or 30-day
+        rolling view). Useful for monitoring training load and recovery over time.
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+        """
+        try:
+            start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            if (end - start).days > 90:
+                return "Date range too large. Please use a range of 90 days or less."
+
+            trend = []
+            current = start
+            while current <= end:
+                date_str = current.strftime("%Y-%m-%d")
+                try:
+                    hrv_data = garmin_client.get_hrv_data(date_str)
+                    if hrv_data:
+                        summary = hrv_data.get("hrvSummary", {})
+                        entry = {
+                            "date": date_str,
+                            "last_night_avg_hrv_ms": summary.get("lastNightAvg"),
+                            "last_night_5min_high_hrv_ms": summary.get("lastNight5MinHigh"),
+                            "weekly_avg_hrv_ms": summary.get("weeklyAvg"),
+                            "status": summary.get("status"),
+                        }
+                        entry = {k: v for k, v in entry.items() if v is not None}
+                        trend.append(entry)
+                except Exception:
+                    pass  # Skip days with no data
+                current += datetime.timedelta(days=1)
+
+            if not trend:
+                return f"No HRV data found between {start_date} and {end_date}."
+
+            return json.dumps({"days": len(trend), "trend": trend}, indent=2)
+        except ValueError:
+            return "Invalid date format. Please use YYYY-MM-DD."
+        except Exception as e:
+            return f"Error retrieving HRV trend: {str(e)}"
+
+    @app.tool()
     async def get_fitnessage_data(date: str, details: bool = False) -> str:
         """Get fitness age data
 
