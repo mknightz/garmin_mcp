@@ -15,6 +15,26 @@ def configure(client):
     garmin_client = client
 
 
+def _http_session(client):
+    """Return the authenticated HTTP session regardless of garminconnect version.
+
+    Newer garminconnect exposes the garth session as `Garmin.garth`; older
+    versions expose it as `Garmin.client`.
+    """
+    return getattr(client, "garth", None) or client.client
+
+
+def _http_ok(response):
+    """True if a raw HTTP call succeeded, across both session flavors.
+
+    garth calls return a requests.Response (check status_code); the old client
+    returns parsed JSON (dict/None) and raises on HTTP errors, so no
+    status_code means the call already succeeded.
+    """
+    status = getattr(response, "status_code", None)
+    return status is None or status in (200, 204)
+
+
 def _fix_hr_zone_step(step: dict) -> None:
     """Fix a common mistake where HR zone targets use targetValueOne instead of zoneNumber.
 
@@ -539,9 +559,9 @@ def register_tools(app):
         """
         try:
             url = f"{garmin_client.garmin_workouts}/workout/{workout_id}"
-            response = garmin_client.client.delete("connectapi", url, api=True)
+            response = _http_session(garmin_client).delete("connectapi", url, api=True)
 
-            if response.status_code == 204 or response.status_code == 200:
+            if _http_ok(response):
                 return json.dumps({
                     "status": "success",
                     "workout_id": workout_id,
@@ -570,9 +590,9 @@ def register_tools(app):
         for workout_id in workout_ids:
             try:
                 url = f"{garmin_client.garmin_workouts}/workout/{workout_id}"
-                response = garmin_client.client.delete("connectapi", url, api=True)
+                response = _http_session(garmin_client).delete("connectapi", url, api=True)
 
-                if response.status_code in (200, 204):
+                if _http_ok(response):
                     results.append({
                         "status": "success",
                         "workout_id": workout_id,
@@ -711,9 +731,9 @@ def register_tools(app):
         """
         try:
             url = f"workout-service/schedule/{workout_id}"
-            response = garmin_client.client.post("connectapi", url, json={"date": calendar_date})
+            response = _http_session(garmin_client).post("connectapi", url, json={"date": calendar_date}, api=True)
 
-            if response.status_code == 200:
+            if _http_ok(response):
                 return json.dumps({
                     "status": "success",
                     "workout_id": workout_id,
@@ -797,9 +817,9 @@ def register_tools(app):
                     workout_name = upload_result.get('workoutName')
 
                 url = f"workout-service/schedule/{workout_id}"
-                response = garmin_client.client.post("connectapi", url, json={"date": calendar_date})
+                response = _http_session(garmin_client).post("connectapi", url, json={"date": calendar_date}, api=True)
 
-                if response.status_code == 200:
+                if _http_ok(response):
                     entry = {
                         "status": "success",
                         "workout_id": workout_id,
