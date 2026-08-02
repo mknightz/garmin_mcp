@@ -14,8 +14,9 @@ Exposes data not available through the REST API:
 import gzip
 import io
 import json
+import os
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 try:
     import fitparse
@@ -110,6 +111,60 @@ def _extract_fit_bytes(raw: bytes) -> bytes:
         return gzip.decompress(raw)
 
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Download directory config (for download_activity_file / set_fit_download_dir)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FIT_CONFIG = "~/.garminconnect_fit_config.json"
+
+
+def _get_fit_config_path() -> str:
+    """Path to the JSON config that stores the default download directory."""
+    return os.getenv("GARMIN_FIT_CONFIG") or _DEFAULT_FIT_CONFIG
+
+
+def _read_fit_config() -> dict:
+    """Read the FIT download config. Returns {} if missing or invalid."""
+    path = os.path.expanduser(_get_fit_config_path())
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_fit_config(dir_path: str) -> None:
+    """Persist the default download directory to the JSON config."""
+    path = os.path.expanduser(_get_fit_config_path())
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    cfg = _read_fit_config()
+    cfg["download_dir"] = dir_path
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _resolve_download_dir(output_dir: Optional[str]) -> Optional[str]:
+    """Resolve the directory for saving activity files (first match wins):
+
+    1. output_dir argument (one-off; not persisted)
+    2. GARMIN_FIT_DOWNLOAD_DIR environment variable
+    3. persisted config (download_dir)
+    Returns an absolute path, or None when nothing is configured.
+    """
+    if output_dir:
+        return os.path.abspath(os.path.expanduser(output_dir))
+    env_dir = os.getenv("GARMIN_FIT_DOWNLOAD_DIR")
+    if env_dir:
+        return os.path.abspath(os.path.expanduser(env_dir))
+    cfg_dir = _read_fit_config().get("download_dir")
+    if cfg_dir:
+        return os.path.abspath(os.path.expanduser(cfg_dir))
+    return None
 
 
 def _safe_avg(values: list) -> Optional[float]:
@@ -581,6 +636,43 @@ def _compute_shift_summary(shifts: list) -> dict:
 # Main FIT parsing logic
 # ---------------------------------------------------------------------------
 
+def _compute_hrv_metrics(rr_intervals_s: List[float]) -> Optional[Dict]:
+    """Compute standard time-domain HRV metrics from R-R intervals (seconds).
+
+    Returns RMSSD, SDNN, pNN50, mean R-R, and count. These are the standard
+    intra-workout HRV metrics used in sports science and HRV-guided training
+    platforms (HRV4Training, Elite HRV, Polar's recovery metrics, etc.).
+
+    Requires at least 10 R-R intervals to produce stable results.
+    """
+    if len(rr_intervals_s) < 10:
+        return None
+
+    rr_ms = [r * 1000.0 for r in rr_intervals_s]
+    diffs = [rr_ms[i + 1] - rr_ms[i] for i in range(len(rr_ms) - 1)]
+
+    # RMSSD: root mean square of successive differences
+    squared = [d * d for d in diffs]
+    rmssd = (sum(squared) / len(squared)) ** 0.5 if squared else 0.0
+
+    # SDNN: standard deviation of all N-N intervals
+    mean_rr = sum(rr_ms) / len(rr_ms)
+    sdnn = (sum((r - mean_rr) ** 2 for r in rr_ms) / (len(rr_ms) - 1)) ** 0.5 if len(rr_ms) > 1 else 0.0
+
+    # pNN50: percentage of pairs differing by more than 50 ms
+    nn50 = sum(1 for d in diffs if abs(d) > 50.0)
+    pnn50 = 100.0 * nn50 / len(diffs) if diffs else 0.0
+
+    return {
+        "rmssd_ms": round(rmssd, 1),
+        "sdnn_ms": round(sdnn, 1),
+        "pnn50_pct": round(pnn50, 2),
+        "mean_rr_ms": round(mean_rr, 1),
+        "mean_hr_bpm": round(60000.0 / mean_rr, 1) if mean_rr > 0 else None,
+        "rr_count": len(rr_ms),
+    }
+
+
 def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
     """Parse a FIT file and extract structured cycling data."""
     fit_bytes = _extract_fit_bytes(fit_bytes)
@@ -590,6 +682,11 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
     laps: List[Dict] = []
     shifts: List[Dict] = []
     records: List[Dict] = []
+    # R-R intervals from the FIT 'hrv' message type, paired with the timestamp
+    # of the most recent record message so we can bucket them per lap later.
+    # Requires "Log HRV" enabled on the watch AND a chest strap paired.
+    rr_pairs: List[tuple] = []  # (record_timestamp, rr_seconds)
+    last_record_ts = None
 
     # Track last values for context at shift time
     last_cadence: Optional[float] = None
@@ -733,6 +830,11 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
             if grade is not None:
                 last_grade = grade
 
+            # Track timestamp for HRV bucketing
+            ts = _get_field(message, "timestamp")
+            if ts is not None:
+                last_record_ts = ts
+
             record: Dict[str, Any] = {
                 "timestamp": str(_get_field(message, "timestamp") or ""),
                 "power_w": _get_field(message, "power"),
@@ -775,6 +877,21 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
             record = {k: v for k, v in record.items() if v is not None}
             records.append(record)
 
+        # ------------------------------------------------------------------
+        # HRV — R-R intervals (one or more per message in field 'time')
+        # ------------------------------------------------------------------
+        elif msg_type == "hrv":
+            rr_field = _get_field(message, "time")
+            if rr_field is None:
+                continue
+            if not isinstance(rr_field, (list, tuple)):
+                rr_field = [rr_field]
+            for rr in rr_field:
+                # Filter sentinel/invalid values. FIT spec uses ~65.535 s
+                # as "no R-R interval detected" filler in fixed-size arrays.
+                if rr is not None and 0.2 < rr < 3.0:
+                    rr_pairs.append((last_record_ts, float(rr)))
+
     # ------------------------------------------------------------------
     # Post-parse enrichment
     # ------------------------------------------------------------------
@@ -814,6 +931,111 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
     if pdc:
         result["power_duration_curve"] = pdc
 
+    # HRV (time-domain) — always include summary if R-R data exists.
+    # Raw R-R array only included when include_records=True (can be large).
+    # Per-lap average power for activities whose lap message has no native
+    # avg_power field (e.g. running with a wrist / Connect IQ power source).
+    # Reuse the same time-window bucketing as HRV, averaging record power_w.
+    if records and any("avg_power_w" not in lap for lap in laps):
+        import datetime as _dt2
+
+        def _parse_iso_pw(s):
+            if not s:
+                return None
+            try:
+                return _dt2.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+
+        rec_pw = []
+        for r in records:
+            pw = r.get("power_w")
+            if pw is None:
+                continue
+            ts_dt = _parse_iso_pw(r.get("timestamp"))
+            if ts_dt is not None:
+                rec_pw.append((ts_dt, float(pw)))
+
+        if rec_pw:
+            for lap in laps:
+                if "avg_power_w" in lap:
+                    continue
+                lap_start = _parse_iso_pw(lap.get("start_time"))
+                elapsed = lap.get("total_elapsed_time_s")
+                if lap_start is None or not elapsed:
+                    continue
+                lap_end = lap_start + _dt2.timedelta(seconds=float(elapsed))
+                vals = []
+                for ts_dt, pw in rec_pw:
+                    a, b, t = lap_start, lap_end, ts_dt
+                    if a.tzinfo and not t.tzinfo:
+                        t = t.replace(tzinfo=a.tzinfo)
+                    elif t.tzinfo and not a.tzinfo:
+                        a = a.replace(tzinfo=t.tzinfo)
+                        b = b.replace(tzinfo=t.tzinfo)
+                    if a <= t < b:
+                        vals.append(pw)
+                if vals:
+                    lap["avg_power_w"] = round(sum(vals) / len(vals))
+                    lap["max_power_w"] = round(max(vals))
+
+    # Also compute per-lap HRV by bucketing R-R intervals by timestamp.
+    if rr_pairs:
+        all_rr = [rr for (_, rr) in rr_pairs]
+        hrv_summary = _compute_hrv_metrics(all_rr)
+        if hrv_summary:
+            result["hrv"] = hrv_summary
+
+        # Per-lap HRV: walk laps in order, derive each lap's [start, end)
+        # window from start_time + total_elapsed_time_s, filter R-R pairs.
+        import datetime as _dt
+
+        def _parse_iso(s):
+            if not s:
+                return None
+            try:
+                # FIT timestamps may be "2026-05-15 02:27:08" or with tz
+                return _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+
+        for lap in laps:
+            lap_start = _parse_iso(lap.get("start_time"))
+            elapsed = lap.get("total_elapsed_time_s")
+            if lap_start is None or not elapsed:
+                continue
+            lap_end = lap_start + _dt.timedelta(seconds=float(elapsed))
+
+            # Filter R-R pairs whose record_ts falls within this lap.
+            # rr_pairs[i][0] is a datetime-like value from fitparse.
+            lap_rr = []
+            for ts, rr in rr_pairs:
+                ts_dt = ts if isinstance(ts, _dt.datetime) else _parse_iso(ts)
+                if ts_dt is None:
+                    continue
+                # Compare naively if either is tz-naive (FIT timestamps are UTC)
+                if lap_start.tzinfo and not ts_dt.tzinfo:
+                    ts_dt = ts_dt.replace(tzinfo=lap_start.tzinfo)
+                elif ts_dt.tzinfo and not lap_start.tzinfo:
+                    lap_start_cmp = lap_start.replace(tzinfo=ts_dt.tzinfo)
+                    lap_end_cmp = lap_end.replace(tzinfo=ts_dt.tzinfo)
+                    if lap_start_cmp <= ts_dt < lap_end_cmp:
+                        lap_rr.append(rr)
+                    continue
+                if lap_start <= ts_dt < lap_end:
+                    lap_rr.append(rr)
+
+            lap_hrv = _compute_hrv_metrics(lap_rr)
+            if lap_hrv:
+                lap["hrv"] = lap_hrv
+
+        if include_records:
+            # Raw stream — list of {timestamp, rr_seconds} for full transparency
+            result["rr_intervals_seconds"] = [
+                {"timestamp": str(ts) if ts else None, "rr_seconds": rr}
+                for (ts, rr) in rr_pairs
+            ]
+
     if include_records:
         result["records"] = records
 
@@ -829,7 +1051,7 @@ def register_tools(app):
 
     @app.tool()
     async def get_activity_fit_data(
-        activity_id: int,
+        activity_id: Union[int, str],
         include_records: bool = False,
     ) -> str:
         """Download and parse FIT file for an activity to expose advanced cycling data.
@@ -869,6 +1091,7 @@ def register_tools(app):
             )
 
         try:
+            activity_id = int(activity_id)
             from garminconnect import Garmin
 
             fit_bytes = garmin_client.download_activity(
@@ -1035,5 +1258,130 @@ def register_tools(app):
 
         except Exception as e:
             return f"Error computing power duration curve: {str(e)}"
+
+    @app.tool()
+    async def download_activity_file(
+        activity_id: Union[int, str],
+        format: str = "fit",
+        output_dir: Optional[str] = None,
+    ) -> str:
+        """Download an activity and save it to disk as a file.
+
+        Saves the activity in the requested format. Defaults to the original .fit
+        file; Garmin also supports gpx, tcx, and csv.
+
+        Directory resolution (first match wins):
+          1. output_dir argument (one-off; not persisted)
+          2. GARMIN_FIT_DOWNLOAD_DIR environment variable
+          3. persisted config (set via set_fit_download_dir)
+        If none is configured, returns status "needs_setup" with a suggested
+        default (the server's current working directory). In that case, ask the
+        user where to save, call set_fit_download_dir(path), then call this tool
+        again.
+
+        Files are named "{activity_id}.{ext}" and overwrite any existing file.
+
+        Args:
+            activity_id: Garmin activity ID
+            format: One of fit, gpx, tcx, csv (default fit)
+            output_dir: Optional one-off directory override (not persisted)
+        """
+        try:
+            fmt = str(format).strip().lower()
+            from garminconnect import Garmin
+
+            format_map = {
+                "fit": Garmin.ActivityDownloadFormat.ORIGINAL,
+                "gpx": Garmin.ActivityDownloadFormat.GPX,
+                "tcx": Garmin.ActivityDownloadFormat.TCX,
+                "csv": Garmin.ActivityDownloadFormat.CSV,
+            }
+            if fmt not in format_map:
+                return json.dumps({
+                    "error": f"Invalid format '{format}'.",
+                    "valid_formats": list(format_map.keys()),
+                }, indent=2)
+
+            download_dir = _resolve_download_dir(output_dir)
+            if download_dir is None:
+                return json.dumps({
+                    "status": "needs_setup",
+                    "suggested_default": os.getcwd(),
+                    "config_path": os.path.expanduser(_get_fit_config_path()),
+                    "message": (
+                        "No download directory configured. Ask the user where to "
+                        "save activity files (offer the current working directory "
+                        "as the default), then call set_fit_download_dir(path) "
+                        "before downloading."
+                    ),
+                }, indent=2)
+
+            activity_id = int(activity_id)
+            os.makedirs(download_dir, exist_ok=True)
+
+            data = garmin_client.download_activity(
+                activity_id, dl_fmt=format_map[fmt]
+            )
+            if not data:
+                return f"No {fmt} data returned for activity {activity_id}"
+
+            raw = bytes(data)
+            if fmt == "fit":
+                try:
+                    payload = _extract_fit_bytes(raw)
+                except Exception as extract_err:
+                    return json.dumps({
+                        "error": str(extract_err),
+                        "debug": {
+                            "total_bytes": len(raw),
+                            "first_16_bytes_hex": raw[:16].hex(),
+                            "hint": (
+                                "1f8b = gzip, 504b = ZIP, 0e10/0c10 = raw FIT, "
+                                "3c or 7b = HTML/JSON error from Garmin"
+                            ),
+                        },
+                    }, indent=2)
+            else:
+                payload = raw
+
+            file_path = os.path.join(download_dir, f"{activity_id}.{fmt}")
+            with open(file_path, "wb") as f:
+                f.write(payload)
+
+            return json.dumps({
+                "activity_id": activity_id,
+                "format": fmt,
+                "file_path": os.path.abspath(file_path),
+                "size_bytes": len(payload),
+                "message": "Activity file saved.",
+            }, indent=2)
+
+        except Exception as e:
+            return f"Error downloading activity {activity_id}: {str(e)}"
+
+    @app.tool()
+    async def set_fit_download_dir(path: str) -> str:
+        """Set and persist the default directory for downloaded activity files.
+
+        Stores the absolute path in a small JSON config file
+        (~/.garminconnect_fit_config.json, overridable via GARMIN_FIT_CONFIG) so
+        download_activity_file can save files without asking again.
+
+        Args:
+            path: Directory where activity files (.fit/.gpx/.tcx/.csv) are saved.
+                  Pass the current working directory to keep files where the
+                  server runs.
+        """
+        try:
+            abspath = os.path.abspath(os.path.expanduser(path))
+            os.makedirs(abspath, exist_ok=True)
+            _write_fit_config(abspath)
+            return json.dumps({
+                "download_dir": abspath,
+                "config_path": os.path.expanduser(_get_fit_config_path()),
+                "message": "Default FIT download directory configured.",
+            }, indent=2)
+        except Exception as e:
+            return f"Error setting FIT download directory: {str(e)}"
 
     return app
